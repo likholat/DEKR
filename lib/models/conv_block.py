@@ -17,6 +17,11 @@ import torch
 import torch.nn as nn
 import torchvision.ops as ops
 
+import math
+from torch.nn.parameter import Parameter
+from torch.nn import init
+
+
 BN_MOMENTUM = 0.1
 logger = logging.getLogger(__name__)
 
@@ -24,7 +29,7 @@ logger = logging.getLogger(__name__)
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, planes, stride=1, 
+    def __init__(self, inplanes, planes, stride=1,
             downsample=None, dilation=1):
         super(BasicBlock, self).__init__()
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=3, stride=stride,
@@ -60,7 +65,7 @@ class BasicBlock(nn.Module):
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, inplanes, planes, stride=1, 
+    def __init__(self, inplanes, planes, stride=1,
             downsample=None, dilation=1):
         super(Bottleneck, self).__init__()
         self.conv1 = nn.Conv2d(inplanes, planes, kernel_size=1, bias=False)
@@ -99,23 +104,58 @@ class Bottleneck(nn.Module):
         return out
 
 
+class DeformableConvFunc(torch.autograd.Function):
+    @staticmethod
+    def symbolic(g, cls, x, offset):
+        weight = cls.state_dict()["weight"]
+        weight = g.op("Constant", value_t=weight)
+
+        return g.op('DeformableConv2D', x, offset, weight,
+                    strides_i=(cls.stride, cls.stride),
+                    pads_i=(cls.padding, cls.padding, cls.padding, cls.padding),
+                    dilations_i=(cls.dilation, cls.dilation),
+                    deformable_group_i=cls.groups
+                    )
+    @staticmethod
+    def forward(self, cls, x, offset):
+        y = cls.origin_forward(x, offset)
+        return y
+
+
+class DeformableConvolutionONNX(ops.DeformConv2d):
+    """
+    This is a support class which helps export network with SparseConv in ONNX format.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.origin_forward = super().forward
+        self.stride = kwargs.get("stride", 1)
+        self.padding = kwargs.get("padding", 0)
+        self.dilation = kwargs.get("dilation", 1)
+        self.groups = kwargs.get("groups", 1)
+
+    def forward(self, x, offset):
+        return DeformableConvFunc.apply(self, x, offset)
+
+
 class AdaptBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, inplanes, outplanes, stride=1, 
+    def __init__(self, inplanes, outplanes, stride=1,
             downsample=None, dilation=1, deformable_groups=1):
         super(AdaptBlock, self).__init__()
         regular_matrix = torch.tensor([[-1, -1, -1, 0, 0, 0, 1, 1, 1],\
-                                       [-1, 0, 1, -1 ,0 ,1 ,-1, 0, 1]])
+                                       [-1, 0, 1, -1, 0, 1, -1, 0, 1]])
         self.register_buffer('regular_matrix', regular_matrix.float())
         self.downsample = downsample
         self.transform_matrix_conv = nn.Conv2d(inplanes, 4, 3, 1, 1, bias=True)
         self.translation_conv = nn.Conv2d(inplanes, 2, 3, 1, 1, bias=True)
-        self.adapt_conv = ops.DeformConv2d(inplanes, outplanes, kernel_size=3, stride=stride, \
-            padding=dilation, dilation=dilation, bias=False, groups=deformable_groups)
+        self.adapt_conv = DeformableConvolutionONNX(inplanes, outplanes, kernel_size=3, stride=stride,
+                                           padding=dilation, dilation=dilation, bias=False, groups=deformable_groups)
         self.bn = nn.BatchNorm2d(outplanes, momentum=BN_MOMENTUM)
         self.relu = nn.ReLU(inplace=True)
- 
+
+
     def forward(self, x):
         residual = x
 
@@ -124,20 +164,20 @@ class AdaptBlock(nn.Module):
         transform_matrix = transform_matrix.permute(0,2,3,1).reshape((N*H*W,2,2))
         offset = torch.matmul(transform_matrix, self.regular_matrix)
         offset = offset-self.regular_matrix
-        offset = offset.transpose(1,2).reshape((N,H,W,18)).permute(0,3,1,2)
+        offset = offset.transpose(1, 2).reshape((N,H,W,18)).permute(0,3,1,2)
 
         translation = self.translation_conv(x)
         offset[:,0::2,:,:] += translation[:,0:1,:,:]
         offset[:,1::2,:,:] += translation[:,1:2,:,:]
- 
+
         out = self.adapt_conv(x, offset)
+
         out = self.bn(out)
-        
+
         if self.downsample is not None:
             residual = self.downsample(x)
- 
+
         out += residual
         out = self.relu(out)
- 
-        return out
 
+        return out
