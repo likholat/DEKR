@@ -133,9 +133,14 @@ class DeformableConvolutionONNX(ops.DeformConv2d):
         self.padding = kwargs.get("padding", 0)
         self.dilation = kwargs.get("dilation", 1)
         self.groups = kwargs.get("groups", 1)
+        self.pad_l = nn.ConstantPad2d((1, 1, 1, 1), 0)
 
     def forward(self, x, offset):
-        return DeformableConvFunc.apply(self, x, offset)
+        x = self.pad_l(x)
+        offset = self.pad_l(offset)
+        y = DeformableConvFunc.apply(self, x, offset)
+        y = y[:, :, 1:-1, 1:-1]
+        return y
 
 
 class AdaptBlock(nn.Module):
